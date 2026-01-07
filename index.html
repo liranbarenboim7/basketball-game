@@ -52,8 +52,7 @@
 <body>
   <div id="ui">
     <div id="status">Status: idle</div>
-    <div id="markerInfo">Hoop marker: (0, 0, 0)</div>
-    <div class="hint">Nudge marker: arrow keys (X/Z), PageUp/PageDown (Y), Shift = faster</div>
+    <div id="markerInfo" style="display: none;"></div>
     <div>
       Load .glb file:
       <input id="fileInput" type="file" accept=".glb" />
@@ -107,6 +106,7 @@ const markerStep = 2;
 const playerUrl = "./3d_person.glb";
 const playerHeightRatio = 0.18;
 const playerOffsetRatio = 0.2;
+const playerFootOffsetRatio = 0.04;
 const jointMarkerBaseRadius = 1;
 const jointMarkerGeometry = new THREE.SphereGeometry(jointMarkerBaseRadius, 14, 14);
 const jointMarkerMaterials = {
@@ -116,6 +116,7 @@ const jointMarkerMaterials = {
   knee: new THREE.MeshBasicMaterial({ color: 0xff7aa2, depthTest: false }),
   foot: new THREE.MeshBasicMaterial({ color: 0xffffff, depthTest: false })
 };
+// Joint marker definitions used to place dots on key body parts.
 const jointMarkerDefs = [
   { key: "shoulderL", type: "shoulder", side: "left", keywords: ["shoulder", "clavicle", "upperarm"], fallback: { dx: -0.22, dy: 0.78, dz: 0 } },
   { key: "shoulderR", type: "shoulder", side: "right", keywords: ["shoulder", "clavicle", "upperarm"], fallback: { dx: 0.22, dy: 0.78, dz: 0 } },
@@ -129,12 +130,10 @@ const jointMarkerDefs = [
   { key: "footR", type: "foot", side: "right", keywords: ["foot", "ankle", "toe"], fallback: { dx: 0.14, dy: 0.04, dz: 0 } }
 ];
 
-const marker = new THREE.Mesh(
-  new THREE.SphereGeometry(6, 16, 16),
-  new THREE.MeshBasicMaterial({ color: 0xff5533 })
-);
+const marker = new THREE.Object3D();
 marker.name = "HoopMarker";
 scene.add(marker);
+marker.visible = false;
 
 let currentModel = null;
 let currentPlayer = null;
@@ -142,6 +141,9 @@ let jointMarkers = [];
 const modelBounds = new THREE.Box3();
 const modelSize = new THREE.Vector3();
 const modelCenter = new THREE.Vector3();
+const groundRaycaster = new THREE.Raycaster();
+const groundRayOrigin = new THREE.Vector3();
+const groundRayDir = new THREE.Vector3(0, -1, 0);
 
 function setStatus(message) {
   statusEl.textContent = `Status: ${message}`;
@@ -198,8 +200,12 @@ function setMarkerWorldRadius(markerMesh, targetRadius, referenceObject) {
 
 function sideFromName(name) {
   const n = name.toLowerCase();
-  const isLeft = /(\bleft\b|_l\b|\.l\b|^l_|_l_|:l\b)/.test(n);
-  const isRight = /(\bright\b|_r\b|\.r\b|^r_|_r_|:r\b)/.test(n);
+  const leftWord = /(^|[^a-z])left/.test(n);
+  const rightWord = /(^|[^a-z])right/.test(n);
+  const leftToken = /(^l_|_l_|:l\b|\.l\b|_l\b|-l\b)/.test(n);
+  const rightToken = /(^r_|_r_|:r\b|\.r\b|_r\b|-r\b)/.test(n);
+  const isLeft = leftWord || leftToken;
+  const isRight = rightWord || rightToken;
   if (isLeft && !isRight) return "left";
   if (isRight && !isLeft) return "right";
   return null;
@@ -225,7 +231,26 @@ function collectBones(root) {
   return bones;
 }
 
-function pickBone(bones, keywords, side) {
+function getFootBoneMinY(player) {
+  const bones = collectBones(player);
+  if (!bones.length) return null;
+  const box = new THREE.Box3().setFromObject(player);
+  const center = new THREE.Vector3();
+  box.getCenter(center);
+  const left = pickBone(bones, ["foot", "ankle", "toe"], "left", center.x);
+  const right = pickBone(bones, ["foot", "ankle", "toe"], "right", center.x);
+  const temp = new THREE.Vector3();
+  let minY = Infinity;
+  [left, right].forEach((bone) => {
+    if (!bone) return;
+    bone.getWorldPosition(temp);
+    minY = Math.min(minY, temp.y);
+  });
+  return Number.isFinite(minY) ? minY : null;
+}
+
+// Choose a bone by keywords; fall back to side/position if needed.
+function pickBone(bones, keywords, side, centerX) {
   const excludes = ["twist", "end", "tip", "finger", "thumb", "index", "middle", "ring", "pinky"];
   const matches = (requireSide) => bones.filter((bone) => {
     const name = (bone.name || "").toLowerCase();
@@ -238,9 +263,21 @@ function pickBone(bones, keywords, side) {
     }
     return true;
   });
-  let candidates = matches(true);
-  if (!candidates.length) {
-    candidates = matches(false);
+  const sideCandidates = matches(true);
+  let candidates = sideCandidates.length ? sideCandidates : matches(false);
+  if (!candidates.length) return null;
+  if (side && Number.isFinite(centerX)) {
+    const tmp = new THREE.Vector3();
+    const withPos = candidates.map((bone) => {
+      bone.getWorldPosition(tmp);
+      return { bone, x: tmp.x, name: bone.name || "" };
+    });
+    const sideFiltered = withPos.filter((entry) =>
+      side === "left" ? entry.x <= centerX : entry.x >= centerX
+    );
+    const pool = sideFiltered.length ? sideFiltered : withPos;
+    pool.sort((a, b) => (side === "left" ? a.x - b.x : b.x - a.x));
+    return pool[0].bone;
   }
   candidates.sort((a, b) => (a.name || "").length - (b.name || "").length);
   return candidates[0] || null;
@@ -254,6 +291,7 @@ function fallbackJointPosition(box, center, size, fallback) {
   );
 }
 
+// Create joint dots and attach them to bones or fallback positions.
 function setupJointMarkers(player) {
   clearJointMarkers();
   player.updateMatrixWorld(true);
@@ -264,16 +302,28 @@ function setupJointMarkers(player) {
   box.getSize(size);
   box.getCenter(center);
   const markerWorldRadius = Math.max(1.5, size.y * 0.015);
+  const shoulderOffset = Math.max(size.x * 0.18, size.y * 0.03);
+  const tempWorldPos = new THREE.Vector3();
 
   jointMarkerDefs.forEach((def) => {
     const markerMesh = createJointMarker(def.key, def.type);
-    const bone = pickBone(bones, def.keywords, def.side);
+    const bone = pickBone(bones, def.keywords, def.side, center.x);
     if (bone) {
+      // Bone-attached dots follow bone animation/rotation automatically.
       bone.add(markerMesh);
-      markerMesh.position.set(0, 0, 0);
+      if (def.type === "shoulder" && def.side) {
+        bone.getWorldPosition(tempWorldPos);
+        tempWorldPos.x += def.side === "left" ? -shoulderOffset : shoulderOffset;
+        markerMesh.position.copy(bone.worldToLocal(tempWorldPos));
+      } else {
+        markerMesh.position.set(0, 0, 0);
+      }
       setMarkerWorldRadius(markerMesh, markerWorldRadius, bone);
     } else {
       const worldPos = fallbackJointPosition(box, center, size, def.fallback);
+      if (def.type === "shoulder" && def.side) {
+        worldPos.x += def.side === "left" ? -shoulderOffset : shoulderOffset;
+      }
       markerMesh.position.copy(player.worldToLocal(worldPos));
       player.add(markerMesh);
       setMarkerWorldRadius(markerMesh, markerWorldRadius, player);
@@ -314,6 +364,20 @@ function frameModel(model) {
   camera.far = dist * 10;
   camera.updateProjectionMatrix();
   controls.update();
+}
+
+function getGroundHeightAt(x, z) {
+  if (!currentModel || modelSize.lengthSq() === 0) {
+    return modelBounds.min.y;
+  }
+  const rayHeight = modelBounds.max.y + modelSize.y * 2 + 10;
+  groundRayOrigin.set(x, rayHeight, z);
+  groundRaycaster.set(groundRayOrigin, groundRayDir);
+  const hits = groundRaycaster.intersectObject(currentModel, true);
+  if (hits.length) {
+    return hits[0].point.y;
+  }
+  return modelBounds.min.y;
 }
 
 function findHoopCandidate(model) {
@@ -370,6 +434,7 @@ function applyModel(model) {
   return positionHoopMarker(currentModel);
 }
 
+// Scale and place the player so the feet touch the court surface.
 function placePlayer(player) {
   if (modelSize.lengthSq() === 0) return;
 
@@ -383,13 +448,21 @@ function placePlayer(player) {
     player.scale.setScalar(targetHeight / size.y);
   }
 
+  const targetX = modelCenter.x;
+  const offsetZ = modelSize.z * playerOffsetRatio;
+  const targetZ = modelCenter.z + offsetZ;
+  const groundY = getGroundHeightAt(targetX, targetZ);
+  player.position.set(targetX, 0, targetZ);
   player.updateMatrixWorld(true);
+
   const box2 = new THREE.Box3().setFromObject(player);
   const size2 = new THREE.Vector3();
   box2.getSize(size2);
-  const groundY = modelBounds.min.y;
-  const offsetZ = modelSize.z * playerOffsetRatio;
-  player.position.set(modelCenter.x, groundY + size2.y * 0.5, modelCenter.z + offsetZ);
+  const footMinY = getFootBoneMinY(player);
+  const baseMinY = footMinY !== null ? footMinY : box2.min.y;
+  const footOffset = size2.y * playerFootOffsetRatio;
+  // Align the lowest foot bone (or mesh bottom) to the court surface.
+  player.position.y += groundY - baseMinY - footOffset;
 }
 
 function loadPlayerModel(label, markerNote) {

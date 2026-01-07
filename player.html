@@ -36,8 +36,8 @@
 <body>
   <div id="hud">
     <div id="status">Status: idle</div>
-    <div id="shoulderInfo">Shoulder marker: none</div>
-    <div class="hint">1=left, 2=right, arrows/PageUp/PageDown move, Shift faster</div>
+    <div id="controlInfo">Control target: none</div>
+    <div class="hint">1/2 shoulders, 3/4 hands, arrows/PageUp/PageDown adjust, W/S = right hand up/down, Shift faster, R reset bone</div>
     <div>Loading <code>./3d_person.glb</code></div>
     <div>Single-file GLB (no external textures).</div>
   </div>
@@ -75,37 +75,43 @@ const axes = new THREE.AxesHelper(120);
 scene.add(axes);
 
 const statusEl = document.getElementById("status");
-const shoulderInfoEl = document.getElementById("shoulderInfo");
-const shoulderMarkerBaseRadius = 1;
-const shoulderMarkerGeometry = new THREE.SphereGeometry(shoulderMarkerBaseRadius, 14, 14);
-const shoulderMaterials = {
-  left: new THREE.MeshBasicMaterial({ color: 0xff6ad5, depthTest: false }),
-  right: new THREE.MeshBasicMaterial({ color: 0x56b6ff, depthTest: false })
+const controlInfoEl = document.getElementById("controlInfo");
+const markerBaseRadius = 0.5;
+const markerGeometry = new THREE.SphereGeometry(markerBaseRadius, 14, 14);
+const markerMaterials = {
+  shoulderL: new THREE.MeshBasicMaterial({ color: 0xff6ad5, depthTest: false }),
+  shoulderR: new THREE.MeshBasicMaterial({ color: 0x56b6ff, depthTest: false }),
+  handL: new THREE.MeshBasicMaterial({ color: 0x6cffb1, depthTest: false }),
+  handR: new THREE.MeshBasicMaterial({ color: 0xffc36a, depthTest: false })
 };
-const shoulderKeywords = ["shoulder", "clavicle", "upperarm", "upper_arm"];
-const shoulderFallbacks = {
-  left: { dx: -0.22, dy: 0.78, dz: 0 },
-  right: { dx: 0.22, dy: 0.78, dz: 0 }
-};
-const shoulderMarkers = { left: null, right: null };
-let shoulderStep = 1;
-let activeShoulder = "left";
+const controlDefs = [
+  { key: "shoulderL", label: "shoulder L", type: "shoulder", side: "left", keywords: ["shoulder", "clavicle", "upperarm", "upper_arm"], fallback: { dx: -0.22, dy: 0.78, dz: 0 }, radius: 0.18 },
+  { key: "shoulderR", label: "shoulder R", type: "shoulder", side: "right", keywords: ["shoulder", "clavicle", "upperarm", "upper_arm"], fallback: { dx: 0.22, dy: 0.78, dz: 0 }, radius: 0.18 },
+  { key: "handL", label: "hand L", type: "hand", side: "left", keywords: ["hand", "wrist"], fallback: { dx: -0.45, dy: 0.52, dz: 0 }, radius: 0.14 },
+  { key: "handR", label: "hand R", type: "hand", side: "right", keywords: ["hand", "wrist"], fallback: { dx: 0.45, dy: 0.52, dz: 0 }, radius: 0.14 }
+];
+const controlTargets = {};
+let controlStep = 1;
+let activeTargetKey = "handR";
+const rotationStep = 0.08;
+const modelScale = 3.25;
 
 function setStatus(message) {
   statusEl.textContent = `Status: ${message}`;
 }
 
-function updateShoulderInfo(note) {
-  if (!shoulderInfoEl) return;
-  const marker = shoulderMarkers[activeShoulder];
-  if (!marker) {
-    shoulderInfoEl.textContent = "Shoulder marker: none";
+function updateControlInfo(note) {
+  if (!controlInfoEl) return;
+  const target = controlTargets[activeTargetKey];
+  if (!target || !target.marker) {
+    controlInfoEl.textContent = "Control target: none";
     return;
   }
   const p = new THREE.Vector3();
-  marker.getWorldPosition(p);
-  const base = `Shoulder marker (${activeShoulder}): (${p.x.toFixed(1)}, ${p.y.toFixed(1)}, ${p.z.toFixed(1)})`;
-  shoulderInfoEl.textContent = note ? `${base} ${note}` : base;
+  target.marker.getWorldPosition(p);
+  const mode = target.bone ? "bone" : "marker";
+  const base = `Control target (${target.label}, ${mode}): (${p.x.toFixed(1)}, ${p.y.toFixed(1)}, ${p.z.toFixed(1)})`;
+  controlInfoEl.textContent = note ? `${base} ${note}` : base;
 }
 
 function frameModel(model) {
@@ -126,7 +132,10 @@ function frameModel(model) {
   box2.getCenter(center2);
 
   controls.target.copy(center2);
-  const dist = Math.max(size2.x, size2.y, size2.z) * 1.5 + 40;
+  const maxDim = Math.max(size2.x, size2.y, size2.z);
+  const fov = THREE.MathUtils.degToRad(camera.fov);
+  let dist = maxDim / (2 * Math.tan(fov / 2));
+  dist = Math.max(dist * 1.4, maxDim * 1.2);
   camera.position.copy(center2).add(new THREE.Vector3(dist, dist * 0.6, dist));
   camera.near = Math.max(0.1, dist / 100);
   camera.far = dist * 10;
@@ -163,11 +172,13 @@ function sideFromName(name) {
   return null;
 }
 
-function pickShoulderBone(bones, side) {
+function pickBone(bones, keywords, side) {
+  const excludes = ["twist", "end", "tip", "finger", "thumb", "index", "middle", "ring", "pinky"];
   const candidates = bones.filter((bone) => {
     const name = (bone.name || "").toLowerCase();
     if (!name) return false;
-    if (!shoulderKeywords.some((key) => name.includes(key))) return false;
+    if (excludes.some((ex) => name.includes(ex))) return false;
+    if (!keywords.some((key) => name.includes(key))) return false;
     const detected = sideFromName(name);
     return detected ? detected === side : true;
   });
@@ -175,9 +186,9 @@ function pickShoulderBone(bones, side) {
   return candidates[0] || null;
 }
 
-function createShoulderMarker(side) {
-  const mesh = new THREE.Mesh(shoulderMarkerGeometry, shoulderMaterials[side]);
-  mesh.name = `Shoulder_${side}`;
+function createMarker(def) {
+  const mesh = new THREE.Mesh(markerGeometry, markerMaterials[def.key]);
+  mesh.name = `Marker_${def.key}`;
   mesh.renderOrder = 10;
   return mesh;
 }
@@ -186,31 +197,34 @@ function setMarkerWorldRadius(markerMesh, targetRadius, referenceObject) {
   const scale = new THREE.Vector3();
   referenceObject.getWorldScale(scale);
   const denom = Math.max(1e-6, scale.x);
-  markerMesh.scale.setScalar(targetRadius / denom / shoulderMarkerBaseRadius);
+  markerMesh.scale.setScalar(targetRadius / denom / markerBaseRadius);
 }
 
-function setupShoulderMarkers(model) {
+function setupControlMarkers(model) {
+  controlDefs.forEach((def) => {
+    const prev = controlTargets[def.key];
+    if (prev && prev.marker && prev.marker.parent) {
+      prev.marker.parent.remove(prev.marker);
+    }
+  });
+
   const bones = collectBones(model);
   const box = new THREE.Box3().setFromObject(model);
   const size = new THREE.Vector3();
   const center = new THREE.Vector3();
   box.getSize(size);
   box.getCenter(center);
-  shoulderStep = Math.max(0.5, size.y * 0.01);
-  const markerWorldRadius = Math.max(1.5, size.y * 0.015);
+  controlStep = Math.max(0.2, size.y * 0.01);
 
-  ["left", "right"].forEach((side) => {
-    if (shoulderMarkers[side] && shoulderMarkers[side].parent) {
-      shoulderMarkers[side].parent.remove(shoulderMarkers[side]);
-    }
-    const marker = createShoulderMarker(side);
-    const bone = pickShoulderBone(bones, side);
+  controlDefs.forEach((def) => {
+    const marker = createMarker(def);
+    const bone = pickBone(bones, def.keywords, def.side);
     if (bone) {
       bone.add(marker);
       marker.position.set(0, 0, 0);
-      setMarkerWorldRadius(marker, markerWorldRadius, bone);
+      setMarkerWorldRadius(marker, def.radius, bone);
     } else {
-      const fallback = shoulderFallbacks[side];
+      const fallback = def.fallback;
       const worldPos = new THREE.Vector3(
         center.x + fallback.dx * size.x,
         box.min.y + fallback.dy * size.y,
@@ -218,11 +232,16 @@ function setupShoulderMarkers(model) {
       );
       marker.position.copy(model.worldToLocal(worldPos));
       model.add(marker);
-      setMarkerWorldRadius(marker, markerWorldRadius, model);
+      setMarkerWorldRadius(marker, def.radius, model);
     }
-    shoulderMarkers[side] = marker;
+    controlTargets[def.key] = {
+      key: def.key,
+      label: def.label,
+      bone,
+      marker
+    };
   });
-  updateShoulderInfo("(ready)");
+  updateControlInfo("(ready)");
 }
 
 const loader = new GLTFLoader();
@@ -230,9 +249,10 @@ setStatus("loading 3d_person.glb");
 loader.load(
   "./3d_person.glb",
   (gltf) => {
+    gltf.scene.scale.setScalar(modelScale);
     scene.add(gltf.scene);
     frameModel(gltf.scene);
-    setupShoulderMarkers(gltf.scene);
+    setupControlMarkers(gltf.scene);
     setStatus("loaded 3d_person.glb");
   },
   undefined,
@@ -253,49 +273,98 @@ window.addEventListener("keydown", (e) => {
   const active = document.activeElement;
   if (active && (active.tagName === "INPUT" || active.tagName === "TEXTAREA")) return;
 
-  if (e.key === "1") {
-    activeShoulder = "left";
-    updateShoulderInfo("(selected)");
-    return;
-  }
-  if (e.key === "2") {
-    activeShoulder = "right";
-    updateShoulderInfo("(selected)");
+  const lowerKey = e.key.toLowerCase();
+  if (lowerKey === "w" || lowerKey === "s") {
+    const direct = controlTargets.handR;
+    if (!direct || !direct.marker) return;
+    activeTargetKey = "handR";
+    const step = e.shiftKey ? controlStep * 5 : controlStep;
+    const rot = e.shiftKey ? rotationStep * 2 : rotationStep;
+    const dir = lowerKey === "w" ? 1 : -1;
+    if (direct.bone) {
+      direct.bone.rotation.x += rot * dir;
+    } else {
+      direct.marker.position.y += step * dir;
+    }
+    e.preventDefault();
+    updateControlInfo(direct.bone ? "(rotated)" : "(moved)");
     return;
   }
 
-  const marker = shoulderMarkers[activeShoulder];
-  if (!marker) return;
+  const selectMap = {
+    "1": "shoulderL",
+    "2": "shoulderR",
+    "3": "handL",
+    "4": "handR"
+  };
+  if (selectMap[e.key]) {
+    activeTargetKey = selectMap[e.key];
+    updateControlInfo("(selected)");
+    return;
+  }
 
-  const step = e.shiftKey ? shoulderStep * 5 : shoulderStep;
+  const target = controlTargets[activeTargetKey];
+  if (!target || !target.marker) return;
+
+  const step = e.shiftKey ? controlStep * 5 : controlStep;
+  const rot = e.shiftKey ? rotationStep * 2 : rotationStep;
   let moved = true;
 
-  switch (e.key) {
-    case "ArrowLeft":
-      marker.position.x -= step;
-      break;
-    case "ArrowRight":
-      marker.position.x += step;
-      break;
-    case "ArrowUp":
-      marker.position.z -= step;
-      break;
-    case "ArrowDown":
-      marker.position.z += step;
-      break;
-    case "PageUp":
-      marker.position.y += step;
-      break;
-    case "PageDown":
-      marker.position.y -= step;
-      break;
-    default:
-      moved = false;
+  if (target.bone) {
+    switch (e.key) {
+      case "ArrowLeft":
+        target.bone.rotation.z += rot;
+        break;
+      case "ArrowRight":
+        target.bone.rotation.z -= rot;
+        break;
+      case "ArrowUp":
+        target.bone.rotation.x += rot;
+        break;
+      case "ArrowDown":
+        target.bone.rotation.x -= rot;
+        break;
+      case "PageUp":
+        target.bone.rotation.y += rot;
+        break;
+      case "PageDown":
+        target.bone.rotation.y -= rot;
+        break;
+      case "r":
+      case "R":
+        target.bone.rotation.set(0, 0, 0);
+        break;
+      default:
+        moved = false;
+    }
+  } else {
+    switch (e.key) {
+      case "ArrowLeft":
+        target.marker.position.x -= step;
+        break;
+      case "ArrowRight":
+        target.marker.position.x += step;
+        break;
+      case "ArrowUp":
+        target.marker.position.z -= step;
+        break;
+      case "ArrowDown":
+        target.marker.position.z += step;
+        break;
+      case "PageUp":
+        target.marker.position.y += step;
+        break;
+      case "PageDown":
+        target.marker.position.y -= step;
+        break;
+      default:
+        moved = false;
+    }
   }
 
   if (moved) {
     e.preventDefault();
-    updateShoulderInfo("(moved)");
+    updateControlInfo(target.bone ? "(rotated)" : "(moved)");
   }
 });
 

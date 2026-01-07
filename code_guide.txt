@@ -1,0 +1,30 @@
+index.html workflow (basketball court)
+
+1) Bootstrapping
+- Imports Three.js, GLTFLoader, OrbitControls.
+- Creates scene, camera, renderer, lights, and OrbitControls.
+- Adds a simple HUD for status and model loading via file input/drag-drop.
+
+2) Court loading
+- GLTFLoader loads `basketball_court.glb` (or the file you choose).
+- frameModel(): centers the court, scales it to a target size, and fits the camera.
+- positionHoopMarker(): tries to find rim/backboard meshes by name hints. The marker is currently hidden.
+
+3) Player loading
+- loadPlayerModel() loads `3d_person.glb` after the court finishes.
+- placePlayer(): scales the player based on court size and uses a raycast to place the feet on the court surface.
+
+4) Joint dots (markers)
+- collectBones(): gathers skeleton bones if the player is rigged.
+- pickBone(): chooses a bone by keywords and side; falls back to position if names are unclear.
+- setupJointMarkers(): attaches dots to bones when possible; otherwise uses a bounding-box fallback.
+- setMarkerWorldRadius(): keeps dots roughly the same size in world space even if the player is scaled.
+
+5) Controls
+- OrbitControls lets you orbit and zoom the camera.
+- The hoop marker can still be nudged by keyboard (marker hidden, but logic kept for later use).
+
+Common tuning points
+- playerUrl: switch to a different player model.
+- playerHeightRatio / playerOffsetRatio / playerFootOffsetRatio: size and placement of the player.
+- jointMarkerMaterials / jointMarkerDefs: colors and joints for dots.
