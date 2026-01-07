@@ -1,0 +1,310 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Player Model</title>
+  <style>
+    body { margin: 0; overflow: hidden; background: #101114; }
+    canvas { display: block; }
+    #hud {
+      position: absolute;
+      top: 12px;
+      left: 12px;
+      z-index: 10;
+      color: #e6e6e6;
+      background: rgba(0, 0, 0, 0.6);
+      padding: 10px 12px;
+      border-radius: 8px;
+      font: 12px/1.4 "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
+      width: 320px;
+    }
+    #hud code {
+      font-family: Consolas, "Courier New", monospace;
+      font-size: 12px;
+    }
+    .hint { color: #bbb; margin-top: 6px; }
+  </style>
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+    }
+  }
+  </script>
+</head>
+<body>
+  <div id="hud">
+    <div id="status">Status: idle</div>
+    <div id="shoulderInfo">Shoulder marker: none</div>
+    <div class="hint">1=left, 2=right, arrows/PageUp/PageDown move, Shift faster</div>
+    <div>Loading <code>./3d_person.glb</code></div>
+    <div>Single-file GLB (no external textures).</div>
+  </div>
+
+<script type="module">
+import * as THREE from "three";
+import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
+import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x101114);
+
+const camera = new THREE.PerspectiveCamera(55, window.innerWidth / window.innerHeight, 0.1, 2000);
+camera.position.set(0, 120, 220);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setPixelRatio(window.devicePixelRatio);
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.0;
+document.body.appendChild(renderer.domElement);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.target.set(0, 90, 0);
+controls.update();
+
+scene.add(new THREE.HemisphereLight(0xffffff, 0x1b1f2a, 0.6));
+const dir = new THREE.DirectionalLight(0xffffff, 1.0);
+dir.position.set(200, 300, 150);
+scene.add(dir);
+
+const axes = new THREE.AxesHelper(120);
+scene.add(axes);
+
+const statusEl = document.getElementById("status");
+const shoulderInfoEl = document.getElementById("shoulderInfo");
+const shoulderMarkerBaseRadius = 1;
+const shoulderMarkerGeometry = new THREE.SphereGeometry(shoulderMarkerBaseRadius, 14, 14);
+const shoulderMaterials = {
+  left: new THREE.MeshBasicMaterial({ color: 0xff6ad5, depthTest: false }),
+  right: new THREE.MeshBasicMaterial({ color: 0x56b6ff, depthTest: false })
+};
+const shoulderKeywords = ["shoulder", "clavicle", "upperarm", "upper_arm"];
+const shoulderFallbacks = {
+  left: { dx: -0.22, dy: 0.78, dz: 0 },
+  right: { dx: 0.22, dy: 0.78, dz: 0 }
+};
+const shoulderMarkers = { left: null, right: null };
+let shoulderStep = 1;
+let activeShoulder = "left";
+
+function setStatus(message) {
+  statusEl.textContent = `Status: ${message}`;
+}
+
+function updateShoulderInfo(note) {
+  if (!shoulderInfoEl) return;
+  const marker = shoulderMarkers[activeShoulder];
+  if (!marker) {
+    shoulderInfoEl.textContent = "Shoulder marker: none";
+    return;
+  }
+  const p = new THREE.Vector3();
+  marker.getWorldPosition(p);
+  const base = `Shoulder marker (${activeShoulder}): (${p.x.toFixed(1)}, ${p.y.toFixed(1)}, ${p.z.toFixed(1)})`;
+  shoulderInfoEl.textContent = note ? `${base} ${note}` : base;
+}
+
+function frameModel(model) {
+  model.updateMatrixWorld(true);
+  const box = new THREE.Box3().setFromObject(model);
+  const size = new THREE.Vector3();
+  const center = new THREE.Vector3();
+  box.getSize(size);
+  box.getCenter(center);
+
+  model.position.sub(center);
+
+  model.updateMatrixWorld(true);
+  const box2 = new THREE.Box3().setFromObject(model);
+  const size2 = new THREE.Vector3();
+  const center2 = new THREE.Vector3();
+  box2.getSize(size2);
+  box2.getCenter(center2);
+
+  controls.target.copy(center2);
+  const dist = Math.max(size2.x, size2.y, size2.z) * 1.5 + 40;
+  camera.position.copy(center2).add(new THREE.Vector3(dist, dist * 0.6, dist));
+  camera.near = Math.max(0.1, dist / 100);
+  camera.far = dist * 10;
+  camera.updateProjectionMatrix();
+  controls.update();
+}
+
+function collectBones(root) {
+  const bones = [];
+  const seen = new Set();
+  root.traverse((obj) => {
+    if (obj.isSkinnedMesh && obj.skeleton) {
+      obj.skeleton.bones.forEach((bone) => {
+        if (!seen.has(bone)) {
+          seen.add(bone);
+          bones.push(bone);
+        }
+      });
+    }
+    if (obj.isBone && !seen.has(obj)) {
+      seen.add(obj);
+      bones.push(obj);
+    }
+  });
+  return bones;
+}
+
+function sideFromName(name) {
+  const n = name.toLowerCase();
+  const isLeft = /(\bleft\b|_l\b|\.l\b|^l_|_l_|:l\b)/.test(n);
+  const isRight = /(\bright\b|_r\b|\.r\b|^r_|_r_|:r\b)/.test(n);
+  if (isLeft && !isRight) return "left";
+  if (isRight && !isLeft) return "right";
+  return null;
+}
+
+function pickShoulderBone(bones, side) {
+  const candidates = bones.filter((bone) => {
+    const name = (bone.name || "").toLowerCase();
+    if (!name) return false;
+    if (!shoulderKeywords.some((key) => name.includes(key))) return false;
+    const detected = sideFromName(name);
+    return detected ? detected === side : true;
+  });
+  candidates.sort((a, b) => (a.name || "").length - (b.name || "").length);
+  return candidates[0] || null;
+}
+
+function createShoulderMarker(side) {
+  const mesh = new THREE.Mesh(shoulderMarkerGeometry, shoulderMaterials[side]);
+  mesh.name = `Shoulder_${side}`;
+  mesh.renderOrder = 10;
+  return mesh;
+}
+
+function setMarkerWorldRadius(markerMesh, targetRadius, referenceObject) {
+  const scale = new THREE.Vector3();
+  referenceObject.getWorldScale(scale);
+  const denom = Math.max(1e-6, scale.x);
+  markerMesh.scale.setScalar(targetRadius / denom / shoulderMarkerBaseRadius);
+}
+
+function setupShoulderMarkers(model) {
+  const bones = collectBones(model);
+  const box = new THREE.Box3().setFromObject(model);
+  const size = new THREE.Vector3();
+  const center = new THREE.Vector3();
+  box.getSize(size);
+  box.getCenter(center);
+  shoulderStep = Math.max(0.5, size.y * 0.01);
+  const markerWorldRadius = Math.max(1.5, size.y * 0.015);
+
+  ["left", "right"].forEach((side) => {
+    if (shoulderMarkers[side] && shoulderMarkers[side].parent) {
+      shoulderMarkers[side].parent.remove(shoulderMarkers[side]);
+    }
+    const marker = createShoulderMarker(side);
+    const bone = pickShoulderBone(bones, side);
+    if (bone) {
+      bone.add(marker);
+      marker.position.set(0, 0, 0);
+      setMarkerWorldRadius(marker, markerWorldRadius, bone);
+    } else {
+      const fallback = shoulderFallbacks[side];
+      const worldPos = new THREE.Vector3(
+        center.x + fallback.dx * size.x,
+        box.min.y + fallback.dy * size.y,
+        center.z + fallback.dz * size.z
+      );
+      marker.position.copy(model.worldToLocal(worldPos));
+      model.add(marker);
+      setMarkerWorldRadius(marker, markerWorldRadius, model);
+    }
+    shoulderMarkers[side] = marker;
+  });
+  updateShoulderInfo("(ready)");
+}
+
+const loader = new GLTFLoader();
+setStatus("loading 3d_person.glb");
+loader.load(
+  "./3d_person.glb",
+  (gltf) => {
+    scene.add(gltf.scene);
+    frameModel(gltf.scene);
+    setupShoulderMarkers(gltf.scene);
+    setStatus("loaded 3d_person.glb");
+  },
+  undefined,
+  (err) => {
+    console.error("Failed to load 3d_person.glb", err);
+    setStatus("failed to load 3d_person.glb");
+  }
+);
+
+function onResize() {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+}
+window.addEventListener("resize", onResize);
+
+window.addEventListener("keydown", (e) => {
+  const active = document.activeElement;
+  if (active && (active.tagName === "INPUT" || active.tagName === "TEXTAREA")) return;
+
+  if (e.key === "1") {
+    activeShoulder = "left";
+    updateShoulderInfo("(selected)");
+    return;
+  }
+  if (e.key === "2") {
+    activeShoulder = "right";
+    updateShoulderInfo("(selected)");
+    return;
+  }
+
+  const marker = shoulderMarkers[activeShoulder];
+  if (!marker) return;
+
+  const step = e.shiftKey ? shoulderStep * 5 : shoulderStep;
+  let moved = true;
+
+  switch (e.key) {
+    case "ArrowLeft":
+      marker.position.x -= step;
+      break;
+    case "ArrowRight":
+      marker.position.x += step;
+      break;
+    case "ArrowUp":
+      marker.position.z -= step;
+      break;
+    case "ArrowDown":
+      marker.position.z += step;
+      break;
+    case "PageUp":
+      marker.position.y += step;
+      break;
+    case "PageDown":
+      marker.position.y -= step;
+      break;
+    default:
+      moved = false;
+  }
+
+  if (moved) {
+    e.preventDefault();
+    updateShoulderInfo("(moved)");
+  }
+});
+
+function animate() {
+  requestAnimationFrame(animate);
+  controls.update();
+  renderer.render(scene, camera);
+}
+animate();
+</script>
+</body>
+</html>

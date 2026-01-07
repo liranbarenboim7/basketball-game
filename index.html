@@ -1,0 +1,533 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Basketball Court</title>
+  <style>
+    body { margin: 0; overflow: hidden; background: #111; }
+    canvas { display: block; }
+    #ui {
+      position: absolute;
+      top: 12px;
+      left: 12px;
+      z-index: 10;
+      width: 340px;
+      color: #e6e6e6;
+      background: rgba(0, 0, 0, 0.65);
+      padding: 12px;
+      border-radius: 8px;
+      font: 13px/1.4 "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
+    }
+    #status { color: #9fd; margin-bottom: 6px; }
+    #markerInfo { color: #ffd28a; margin-bottom: 6px; }
+    #dropZone {
+      margin-top: 8px;
+      padding: 10px;
+      border: 1px dashed #666;
+      border-radius: 6px;
+      text-align: center;
+      color: #bbb;
+    }
+    #dropZone.drag {
+      border-color: #8cf;
+      background: rgba(140, 204, 255, 0.15);
+      color: #e6f3ff;
+    }
+    #ui code {
+      font-family: Consolas, "Courier New", monospace;
+      font-size: 12px;
+    }
+    #ui input[type="file"] { margin-top: 4px; }
+    .hint { color: #bbb; margin-top: 8px; }
+  </style>
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+    }
+  }
+  </script>
+</head>
+<body>
+  <div id="ui">
+    <div id="status">Status: idle</div>
+    <div id="markerInfo">Hoop marker: (0, 0, 0)</div>
+    <div class="hint">Nudge marker: arrow keys (X/Z), PageUp/PageDown (Y), Shift = faster</div>
+    <div>
+      Load .glb file:
+      <input id="fileInput" type="file" accept=".glb" />
+    </div>
+    <div id="dropZone">Drop a .glb file here</div>
+    <div class="hint">
+      To auto-load <code>./basketball_court.glb</code>, run a local server:
+      <code>python -m http.server 8000</code> and open <code>http://localhost:8000</code>
+    </div>
+  </div>
+
+<script type="module">
+import * as THREE from "three";
+import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
+import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x111111);
+
+const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 5000);
+camera.position.set(0, 300, 600);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setPixelRatio(window.devicePixelRatio);
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.0;
+document.body.appendChild(renderer.domElement);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.target.set(0, 0, 0);
+controls.update();
+
+scene.add(new THREE.AmbientLight(0xffffff, 0.6));
+const dir = new THREE.DirectionalLight(0xffffff, 1.0);
+dir.position.set(300, 500, 300);
+scene.add(dir);
+
+scene.add(new THREE.AxesHelper(200));
+
+const loader = new GLTFLoader();
+const statusEl = document.getElementById("status");
+const markerInfoEl = document.getElementById("markerInfo");
+const fileInput = document.getElementById("fileInput");
+const dropZone = document.getElementById("dropZone");
+
+const hoopNameHints = ["rim", "hoop", "ring", "basket", "backboard", "net"];
+const markerStep = 2;
+const playerUrl = "./3d_person.glb";
+const playerHeightRatio = 0.18;
+const playerOffsetRatio = 0.2;
+const jointMarkerBaseRadius = 1;
+const jointMarkerGeometry = new THREE.SphereGeometry(jointMarkerBaseRadius, 14, 14);
+const jointMarkerMaterials = {
+  shoulder: new THREE.MeshBasicMaterial({ color: 0xffc36a, depthTest: false }),
+  elbow: new THREE.MeshBasicMaterial({ color: 0x66c4ff, depthTest: false }),
+  hand: new THREE.MeshBasicMaterial({ color: 0x6cffb1, depthTest: false }),
+  knee: new THREE.MeshBasicMaterial({ color: 0xff7aa2, depthTest: false }),
+  foot: new THREE.MeshBasicMaterial({ color: 0xffffff, depthTest: false })
+};
+const jointMarkerDefs = [
+  { key: "shoulderL", type: "shoulder", side: "left", keywords: ["shoulder", "clavicle", "upperarm"], fallback: { dx: -0.22, dy: 0.78, dz: 0 } },
+  { key: "shoulderR", type: "shoulder", side: "right", keywords: ["shoulder", "clavicle", "upperarm"], fallback: { dx: 0.22, dy: 0.78, dz: 0 } },
+  { key: "elbowL", type: "elbow", side: "left", keywords: ["elbow", "lowerarm", "forearm"], fallback: { dx: -0.35, dy: 0.62, dz: 0 } },
+  { key: "elbowR", type: "elbow", side: "right", keywords: ["elbow", "lowerarm", "forearm"], fallback: { dx: 0.35, dy: 0.62, dz: 0 } },
+  { key: "handL", type: "hand", side: "left", keywords: ["hand", "wrist"], fallback: { dx: -0.45, dy: 0.52, dz: 0 } },
+  { key: "handR", type: "hand", side: "right", keywords: ["hand", "wrist"], fallback: { dx: 0.45, dy: 0.52, dz: 0 } },
+  { key: "kneeL", type: "knee", side: "left", keywords: ["knee", "calf", "lowerleg"], fallback: { dx: -0.12, dy: 0.32, dz: 0 } },
+  { key: "kneeR", type: "knee", side: "right", keywords: ["knee", "calf", "lowerleg"], fallback: { dx: 0.12, dy: 0.32, dz: 0 } },
+  { key: "footL", type: "foot", side: "left", keywords: ["foot", "ankle", "toe"], fallback: { dx: -0.14, dy: 0.04, dz: 0 } },
+  { key: "footR", type: "foot", side: "right", keywords: ["foot", "ankle", "toe"], fallback: { dx: 0.14, dy: 0.04, dz: 0 } }
+];
+
+const marker = new THREE.Mesh(
+  new THREE.SphereGeometry(6, 16, 16),
+  new THREE.MeshBasicMaterial({ color: 0xff5533 })
+);
+marker.name = "HoopMarker";
+scene.add(marker);
+
+let currentModel = null;
+let currentPlayer = null;
+let jointMarkers = [];
+const modelBounds = new THREE.Box3();
+const modelSize = new THREE.Vector3();
+const modelCenter = new THREE.Vector3();
+
+function setStatus(message) {
+  statusEl.textContent = `Status: ${message}`;
+}
+
+function updateMarkerInfo(note) {
+  if (!markerInfoEl) return;
+  const p = marker.position;
+  const base = `Hoop marker: (${p.x.toFixed(1)}, ${p.y.toFixed(1)}, ${p.z.toFixed(1)})`;
+  markerInfoEl.textContent = note ? `${base} ${note}` : base;
+}
+
+function disposeMaterial(material) {
+  if (Array.isArray(material)) {
+    material.forEach(disposeMaterial);
+    return;
+  }
+  if (material.map) material.map.dispose();
+  if (material.normalMap) material.normalMap.dispose();
+  if (material.roughnessMap) material.roughnessMap.dispose();
+  if (material.metalnessMap) material.metalnessMap.dispose();
+  material.dispose();
+}
+
+function disposeModel(model) {
+  scene.remove(model);
+  model.traverse((obj) => {
+    if (obj.geometry) obj.geometry.dispose();
+    if (obj.material) disposeMaterial(obj.material);
+  });
+}
+
+function createJointMarker(label, type) {
+  const material = jointMarkerMaterials[type] || jointMarkerMaterials.hand;
+  const markerMesh = new THREE.Mesh(jointMarkerGeometry, material);
+  markerMesh.name = `Joint_${label}`;
+  markerMesh.renderOrder = 10;
+  return markerMesh;
+}
+
+function clearJointMarkers() {
+  jointMarkers.forEach((markerMesh) => {
+    if (markerMesh.parent) markerMesh.parent.remove(markerMesh);
+  });
+  jointMarkers = [];
+}
+
+function setMarkerWorldRadius(markerMesh, targetRadius, referenceObject) {
+  const scale = new THREE.Vector3();
+  referenceObject.getWorldScale(scale);
+  const denom = Math.max(1e-6, scale.x);
+  markerMesh.scale.setScalar(targetRadius / denom / jointMarkerBaseRadius);
+}
+
+function sideFromName(name) {
+  const n = name.toLowerCase();
+  const isLeft = /(\bleft\b|_l\b|\.l\b|^l_|_l_|:l\b)/.test(n);
+  const isRight = /(\bright\b|_r\b|\.r\b|^r_|_r_|:r\b)/.test(n);
+  if (isLeft && !isRight) return "left";
+  if (isRight && !isLeft) return "right";
+  return null;
+}
+
+function collectBones(root) {
+  const bones = [];
+  const seen = new Set();
+  root.traverse((obj) => {
+    if (obj.isSkinnedMesh && obj.skeleton) {
+      obj.skeleton.bones.forEach((bone) => {
+        if (!seen.has(bone)) {
+          seen.add(bone);
+          bones.push(bone);
+        }
+      });
+    }
+    if (obj.isBone && !seen.has(obj)) {
+      seen.add(obj);
+      bones.push(obj);
+    }
+  });
+  return bones;
+}
+
+function pickBone(bones, keywords, side) {
+  const excludes = ["twist", "end", "tip", "finger", "thumb", "index", "middle", "ring", "pinky"];
+  const matches = (requireSide) => bones.filter((bone) => {
+    const name = (bone.name || "").toLowerCase();
+    if (!name) return false;
+    if (excludes.some((ex) => name.includes(ex))) return false;
+    if (!keywords.some((key) => name.includes(key))) return false;
+    if (requireSide) {
+      const detected = sideFromName(name);
+      return detected === side;
+    }
+    return true;
+  });
+  let candidates = matches(true);
+  if (!candidates.length) {
+    candidates = matches(false);
+  }
+  candidates.sort((a, b) => (a.name || "").length - (b.name || "").length);
+  return candidates[0] || null;
+}
+
+function fallbackJointPosition(box, center, size, fallback) {
+  return new THREE.Vector3(
+    center.x + fallback.dx * size.x,
+    box.min.y + fallback.dy * size.y,
+    center.z + fallback.dz * size.z
+  );
+}
+
+function setupJointMarkers(player) {
+  clearJointMarkers();
+  player.updateMatrixWorld(true);
+  const bones = collectBones(player);
+  const box = new THREE.Box3().setFromObject(player);
+  const size = new THREE.Vector3();
+  const center = new THREE.Vector3();
+  box.getSize(size);
+  box.getCenter(center);
+  const markerWorldRadius = Math.max(1.5, size.y * 0.015);
+
+  jointMarkerDefs.forEach((def) => {
+    const markerMesh = createJointMarker(def.key, def.type);
+    const bone = pickBone(bones, def.keywords, def.side);
+    if (bone) {
+      bone.add(markerMesh);
+      markerMesh.position.set(0, 0, 0);
+      setMarkerWorldRadius(markerMesh, markerWorldRadius, bone);
+    } else {
+      const worldPos = fallbackJointPosition(box, center, size, def.fallback);
+      markerMesh.position.copy(player.worldToLocal(worldPos));
+      player.add(markerMesh);
+      setMarkerWorldRadius(markerMesh, markerWorldRadius, player);
+    }
+    jointMarkers.push(markerMesh);
+  });
+}
+
+function frameModel(model) {
+  model.updateMatrixWorld(true);
+  const box = new THREE.Box3().setFromObject(model);
+  const size = new THREE.Vector3();
+  const center = new THREE.Vector3();
+  box.getSize(size);
+  box.getCenter(center);
+
+  model.position.sub(center);
+  const maxDim = Math.max(size.x, size.y, size.z);
+  const targetSize = 400;
+  if (Number.isFinite(maxDim) && maxDim > 0) {
+    model.scale.setScalar(targetSize / maxDim);
+  }
+
+  model.updateMatrixWorld(true);
+  const box2 = new THREE.Box3().setFromObject(model);
+  const size2 = new THREE.Vector3();
+  const center2 = new THREE.Vector3();
+  box2.getSize(size2);
+  box2.getCenter(center2);
+  modelBounds.copy(box2);
+  modelSize.copy(size2);
+  modelCenter.copy(center2);
+
+  controls.target.copy(center2);
+  const dist = Math.max(size2.x, size2.y, size2.z) * 1.25 + 50;
+  camera.position.copy(center2).add(new THREE.Vector3(dist, dist * 0.6, dist));
+  camera.near = Math.max(0.1, dist / 100);
+  camera.far = dist * 10;
+  camera.updateProjectionMatrix();
+  controls.update();
+}
+
+function findHoopCandidate(model) {
+  let best = null;
+  let bestScore = Infinity;
+  model.traverse((obj) => {
+    if (!obj.isMesh) return;
+    const name = (obj.name || "").toLowerCase();
+    if (!name) return;
+    if (!hoopNameHints.some((hint) => name.includes(hint))) return;
+    const box = new THREE.Box3().setFromObject(obj);
+    const size = new THREE.Vector3();
+    box.getSize(size);
+    const score = Math.max(size.x, size.y, size.z);
+    if (score > 0 && score < bestScore) {
+      best = obj;
+      bestScore = score;
+    }
+  });
+  return best;
+}
+
+function positionHoopMarker(model) {
+  const candidate = findHoopCandidate(model);
+  if (candidate) {
+    candidate.updateMatrixWorld(true);
+    const box = new THREE.Box3().setFromObject(candidate);
+    const size = new THREE.Vector3();
+    const center = new THREE.Vector3();
+    box.getSize(size);
+    box.getCenter(center);
+    marker.position.copy(center);
+    updateMarkerInfo("(auto)");
+    return `marker: ${candidate.name || "auto"}`;
+  }
+
+  const box = new THREE.Box3().setFromObject(model);
+  const size = new THREE.Vector3();
+  const center = new THREE.Vector3();
+  box.getSize(size);
+  box.getCenter(center);
+  marker.position.set(center.x, center.y + size.y * 0.15, center.z + size.z * 0.25);
+  updateMarkerInfo("(guess)");
+  return "marker: guess";
+}
+
+function applyModel(model) {
+  if (currentModel) {
+    disposeModel(currentModel);
+  }
+  currentModel = model;
+  scene.add(currentModel);
+  frameModel(currentModel);
+  return positionHoopMarker(currentModel);
+}
+
+function placePlayer(player) {
+  if (modelSize.lengthSq() === 0) return;
+
+  player.updateMatrixWorld(true);
+  const box = new THREE.Box3().setFromObject(player);
+  const size = new THREE.Vector3();
+  box.getSize(size);
+  const baseSpan = Math.max(modelSize.x, modelSize.z);
+  const targetHeight = baseSpan * playerHeightRatio;
+  if (Number.isFinite(size.y) && size.y > 0) {
+    player.scale.setScalar(targetHeight / size.y);
+  }
+
+  player.updateMatrixWorld(true);
+  const box2 = new THREE.Box3().setFromObject(player);
+  const size2 = new THREE.Vector3();
+  box2.getSize(size2);
+  const groundY = modelBounds.min.y;
+  const offsetZ = modelSize.z * playerOffsetRatio;
+  player.position.set(modelCenter.x, groundY + size2.y * 0.5, modelCenter.z + offsetZ);
+}
+
+function loadPlayerModel(label, markerNote) {
+  if (currentPlayer) {
+    disposeModel(currentPlayer);
+    clearJointMarkers();
+    currentPlayer = null;
+  }
+
+  if (!playerUrl) {
+    setStatus(`loaded ${label} (${markerNote})`);
+    return;
+  }
+
+  loader.load(
+    playerUrl,
+    (gltf) => {
+      currentPlayer = gltf.scene;
+      scene.add(currentPlayer);
+      placePlayer(currentPlayer);
+      setupJointMarkers(currentPlayer);
+      setStatus(`loaded ${label} (${markerNote}), player loaded`);
+    },
+    undefined,
+    (err) => {
+      console.error("Failed to load player", err);
+      setStatus(`loaded ${label} (${markerNote}), player missing`);
+    }
+  );
+}
+
+function loadModelFromUrl(url, label, revokeUrl) {
+  setStatus(`loading ${label}`);
+  loader.load(
+    url,
+    (gltf) => {
+      if (revokeUrl) URL.revokeObjectURL(url);
+      const markerNote = applyModel(gltf.scene);
+      setStatus(`loaded ${label} (${markerNote}), loading player...`);
+      loadPlayerModel(label, markerNote);
+    },
+    undefined,
+    (err) => {
+      if (revokeUrl) URL.revokeObjectURL(url);
+      console.error("Failed to load GLB", err);
+      const isFile = window.location.protocol === "file:";
+      const hint = isFile ? " (use a local server or file picker)" : "";
+      setStatus(`failed to load ${label}${hint}`);
+    }
+  );
+}
+
+fileInput.addEventListener("change", () => {
+  const file = fileInput.files && fileInput.files[0];
+  if (!file) return;
+  if (!/\.glb$/i.test(file.name)) {
+    setStatus("unsupported file type");
+    return;
+  }
+  const url = URL.createObjectURL(file);
+  loadModelFromUrl(url, file.name, true);
+});
+
+["dragenter", "dragover"].forEach((evt) => {
+  dropZone.addEventListener(evt, (e) => {
+    e.preventDefault();
+    dropZone.classList.add("drag");
+  });
+});
+["dragleave", "drop"].forEach((evt) => {
+  dropZone.addEventListener(evt, (e) => {
+    e.preventDefault();
+    dropZone.classList.remove("drag");
+  });
+});
+
+dropZone.addEventListener("drop", (e) => {
+  const file = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+  if (!file) return;
+  if (!/\.glb$/i.test(file.name)) {
+    setStatus("unsupported file type");
+    return;
+  }
+  const url = URL.createObjectURL(file);
+  loadModelFromUrl(url, file.name, true);
+});
+
+window.addEventListener("keydown", (e) => {
+  const active = document.activeElement;
+  if (active && (active.tagName === "INPUT" || active.tagName === "TEXTAREA")) return;
+
+  const step = e.shiftKey ? markerStep * 5 : markerStep;
+  let moved = true;
+
+  switch (e.key) {
+    case "ArrowLeft":
+      marker.position.x -= step;
+      break;
+    case "ArrowRight":
+      marker.position.x += step;
+      break;
+    case "ArrowUp":
+      marker.position.z -= step;
+      break;
+    case "ArrowDown":
+      marker.position.z += step;
+      break;
+    case "PageUp":
+      marker.position.y += step;
+      break;
+    case "PageDown":
+      marker.position.y -= step;
+      break;
+    default:
+      moved = false;
+  }
+
+  if (moved) {
+    e.preventDefault();
+    updateMarkerInfo("(manual)");
+  }
+});
+
+loadModelFromUrl("./basketball_court.glb", "basketball_court.glb", false);
+
+function onResize() {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+}
+window.addEventListener("resize", onResize);
+
+function animate() {
+  requestAnimationFrame(animate);
+  controls.update();
+  renderer.render(scene, camera);
+}
+animate();
+</script>
+</body>
+</html>
