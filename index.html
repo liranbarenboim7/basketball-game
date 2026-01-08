@@ -58,6 +58,7 @@
       <input id="fileInput" type="file" accept=".glb" />
     </div>
     <div id="dropZone">Drop a .glb file here</div>
+    <div class="hint">Yellow dots mark the court corners and center.</div>
     <div class="hint">
       To auto-load <code>./basketball_court.glb</code>, run a local server:
       <code>python -m http.server 8000</code> and open <code>http://localhost:8000</code>
@@ -107,6 +108,11 @@ const playerUrl = "./3d_person.glb";
 const playerToCourtRatio = 1 / 8.75;
 const playerOffsetRatio = 0.2;
 const playerFootOffsetRatio = 0.04;
+// Stretch the court along X/Z only (no height scaling).
+const courtWidthAxis = "both";
+const courtWidthScaleFactor = 2.5;
+// Toggle hoop/backboard dots.
+const hoopDotsEnabled = false;
 const jointMarkerBaseRadius = 1;
 const jointMarkerGeometry = new THREE.SphereGeometry(jointMarkerBaseRadius, 14, 14);
 const jointMarkerMaterials = {
@@ -135,12 +141,37 @@ marker.name = "HoopMarker";
 scene.add(marker);
 marker.visible = false;
 
+const hoopMarkerBaseRadius = 1;
+const hoopMarkerGeometry = new THREE.SphereGeometry(hoopMarkerBaseRadius, 14, 14);
+const hoopMarkerMaterials = {
+  stand: new THREE.MeshBasicMaterial({ color: 0xff6b6b, depthTest: false }),
+  net: new THREE.MeshBasicMaterial({ color: 0x52d0ff, depthTest: false })
+};
+const standNameHints = ["stand", "pole", "post", "support", "stanchion"];
+const backboardNameHints = ["backboard", "board"];
+const netNameHints = ["net", "rim", "hoop", "ring", "basket"];
+const hoopExcludeHints = ["fence", "wall", "court", "ground", "floor", "bench"];
+let hoopMarkers = [];
+const backboardMarkerBaseRadius = 1;
+const backboardMarkerGeometry = new THREE.SphereGeometry(backboardMarkerBaseRadius, 12, 12);
+const backboardMarkerMaterial = new THREE.MeshBasicMaterial({ color: 0xfff2a1, depthTest: false });
+const backboardScaleFactor = 1.5;
+let backboardCornerMarkers = [];
+const backboardTempBoxA = new THREE.Box3();
+const backboardTempBoxB = new THREE.Box3();
+const backboardTempVecA = new THREE.Vector3();
+const backboardTempVecB = new THREE.Vector3();
+const backboardTempMat = new THREE.Matrix4();
+
 const courtMarkerBaseRadius = 1;
 const courtMarkerGeometry = new THREE.SphereGeometry(courtMarkerBaseRadius, 12, 12);
 const courtMarkerMaterial = new THREE.MeshBasicMaterial({ color: 0xffcc00, depthTest: false });
 const courtMarkerGroup = new THREE.Group();
 courtMarkerGroup.name = "CourtMarkers";
 scene.add(courtMarkerGroup);
+// Change this multiplier to scale the court without resizing the player.
+let courtScaleFactor = 1;
+let courtBaseScale = 1;
 
 let currentModel = null;
 let currentPlayer = null;
@@ -198,17 +229,363 @@ function clearJointMarkers() {
   jointMarkers = [];
 }
 
-function setMarkerWorldRadius(markerMesh, targetRadius, referenceObject) {
+function setMarkerWorldRadius(markerMesh, targetRadius, referenceObject, baseRadius = jointMarkerBaseRadius) {
   const scale = new THREE.Vector3();
   referenceObject.getWorldScale(scale);
   const denom = Math.max(1e-6, scale.x);
-  markerMesh.scale.setScalar(targetRadius / denom / jointMarkerBaseRadius);
+  markerMesh.scale.setScalar(targetRadius / denom / baseRadius);
+}
+
+function updateCourtBounds(model) {
+  const target = model || currentModel;
+  if (!target) return;
+  target.updateMatrixWorld(true);
+  const box2 = new THREE.Box3().setFromObject(target);
+  const size2 = new THREE.Vector3();
+  const center2 = new THREE.Vector3();
+  box2.getSize(size2);
+  box2.getCenter(center2);
+  modelBounds.copy(box2);
+  modelSize.copy(size2);
+  modelCenter.copy(center2);
 }
 
 function clearCourtMarkers() {
   while (courtMarkerGroup.children.length) {
     courtMarkerGroup.remove(courtMarkerGroup.children[0]);
   }
+}
+
+function createHoopMarker(type) {
+  const material = hoopMarkerMaterials[type] || hoopMarkerMaterials.net;
+  const markerMesh = new THREE.Mesh(hoopMarkerGeometry, material);
+  markerMesh.name = `Hoop_${type}`;
+  markerMesh.renderOrder = 9;
+  return markerMesh;
+}
+
+function clearHoopMarkers() {
+  hoopMarkers.forEach((markerMesh) => {
+    if (markerMesh.parent) markerMesh.parent.remove(markerMesh);
+  });
+  hoopMarkers = [];
+}
+
+function createBackboardCornerMarker(index) {
+  const markerMesh = new THREE.Mesh(backboardMarkerGeometry, backboardMarkerMaterial);
+  markerMesh.name = `BackboardCorner_${index + 1}`;
+  markerMesh.renderOrder = 9;
+  return markerMesh;
+}
+
+function clearBackboardCornerMarkers() {
+  backboardCornerMarkers.forEach((markerMesh) => {
+    if (markerMesh.parent) markerMesh.parent.remove(markerMesh);
+  });
+  backboardCornerMarkers = [];
+}
+
+function collectNamedMeshes(root, hints) {
+  const matches = [];
+  root.traverse((obj) => {
+    if (!obj.isMesh) return;
+    const name = (obj.name || "").toLowerCase();
+    if (!name) return;
+    if (hoopExcludeHints.some((hint) => name.includes(hint))) return;
+    if (!hints.some((hint) => name.includes(hint))) return;
+    const box = new THREE.Box3().setFromObject(obj);
+    const size = new THREE.Vector3();
+    box.getSize(size);
+    if (size.lengthSq() === 0) return;
+    const center = new THREE.Vector3();
+    box.getCenter(center);
+    matches.push({ mesh: obj, name, size, center });
+  });
+  return matches;
+}
+
+function selectHoopTargets(candidates, type) {
+  if (!candidates.length) return [];
+  const sorted = candidates.slice().sort((a, b) => {
+    if (type === "stand") return b.size.y - a.size.y;
+    if (type === "backboard") {
+      const areaA = Math.max(a.size.x, a.size.y, a.size.z) *
+        ([a.size.x, a.size.y, a.size.z].sort((x, y) => y - x)[1]);
+      const areaB = Math.max(b.size.x, b.size.y, b.size.z) *
+        ([b.size.x, b.size.y, b.size.z].sort((x, y) => y - x)[1]);
+      return areaB - areaA;
+    }
+    const aMax = Math.max(a.size.x, a.size.y, a.size.z);
+    const bMax = Math.max(b.size.x, b.size.y, b.size.z);
+    return aMax - bMax;
+  });
+  const axis = modelSize.x >= modelSize.z ? "x" : "z";
+  const sideEps = Math.max(1, modelSize[axis] * 0.05);
+  const left = sorted.filter((cand) => cand.center[axis] < modelCenter[axis] - sideEps);
+  const right = sorted.filter((cand) => cand.center[axis] > modelCenter[axis] + sideEps);
+  const picked = [];
+  if (left.length) picked.push(left[0]);
+  if (right.length) picked.push(right[0]);
+  if (!picked.length && sorted.length) picked.push(sorted[0]);
+  if (picked.length < 2) {
+    sorted.forEach((cand) => {
+      if (picked.includes(cand)) return;
+      picked.push(cand);
+      if (picked.length >= 2) return;
+    });
+  }
+  return picked;
+}
+
+function collectAllMeshes(root) {
+  const matches = [];
+  root.traverse((obj) => {
+    if (!obj.isMesh) return;
+    const box = new THREE.Box3().setFromObject(obj);
+    const size = new THREE.Vector3();
+    box.getSize(size);
+    if (size.lengthSq() === 0) return;
+    const center = new THREE.Vector3();
+    box.getCenter(center);
+    matches.push({ mesh: obj, name: (obj.name || "").toLowerCase(), size, center, box });
+  });
+  return matches;
+}
+
+function filterHoopCandidates(candidates) {
+  return candidates.filter((cand) => {
+    const maxDim = Math.max(cand.size.x, cand.size.y, cand.size.z);
+    if (maxDim <= 0) return false;
+    if (cand.size.x > modelSize.x * 0.85 && cand.size.z > modelSize.z * 0.85) return false;
+    if (cand.size.x > modelSize.x * 0.85 || cand.size.z > modelSize.z * 0.85) return false;
+    if (cand.size.y > modelSize.y * 0.98) return false;
+    return true;
+  });
+}
+
+function splitHoopRegions(candidates) {
+  const axis = modelSize.x >= modelSize.z ? "x" : "z";
+  const minAxis = modelBounds.min[axis];
+  const maxAxis = modelBounds.max[axis];
+  const span = maxAxis - minAxis;
+  const edge = span * 0.2;
+  const nearMin = candidates.filter((cand) => cand.center[axis] < minAxis + edge);
+  const nearMax = candidates.filter((cand) => cand.center[axis] > maxAxis - edge);
+  return { nearMin, nearMax };
+}
+
+function pickStandCandidate(region) {
+  if (!region.length) return null;
+  const scored = region.map((cand) => {
+    const width = Math.max(cand.size.x, cand.size.z);
+    const slender = cand.size.y / Math.max(1e-3, width);
+    const score = slender * cand.size.y - width * 0.25;
+    return { cand, score };
+  });
+  scored.sort((a, b) => b.score - a.score);
+  return scored[0] ? scored[0].cand : null;
+}
+
+function pickBackboardCandidate(region) {
+  if (!region.length) return null;
+  const minHeight = modelBounds.min.y + modelSize.y * 0.35;
+  const scored = region
+    .filter((cand) => cand.center.y > minHeight)
+    .map((cand) => {
+      const dims = [cand.size.x, cand.size.y, cand.size.z].sort((a, b) => b - a);
+      const maxDim = dims[0];
+      const midDim = dims[1];
+      const minDim = dims[2];
+      if (midDim / Math.max(1e-3, maxDim) < 0.4) return null;
+      if (minDim / Math.max(1e-3, maxDim) > 0.25) return null;
+      const faceArea = maxDim * midDim;
+      const score = faceArea / Math.max(1e-3, minDim);
+      return { cand, score };
+    })
+    .filter(Boolean);
+  scored.sort((a, b) => b.score - a.score);
+  return scored[0] ? scored[0].cand : null;
+}
+
+function pickNetCandidate(region, stand) {
+  if (!region.length) return null;
+  const minHeight = modelBounds.min.y + modelSize.y * 0.25;
+  const standTop = stand ? stand.box.max.y : null;
+  const scored = region
+    .filter((cand) => cand.center.y > minHeight)
+    .map((cand) => {
+      const maxDim = Math.max(cand.size.x, cand.size.y, cand.size.z);
+      const heightPenalty = standTop ? Math.abs(cand.box.max.y - standTop) : 0;
+      const score = -maxDim - heightPenalty * 0.15;
+      return { cand, score };
+    });
+  scored.sort((a, b) => b.score - a.score);
+  return scored[0] ? scored[0].cand : null;
+}
+
+function getThinAxisFromSize(size) {
+  if (size.x <= size.y && size.x <= size.z) return "x";
+  if (size.y <= size.x && size.y <= size.z) return "y";
+  return "z";
+}
+
+function scaleMeshPreserveCenter(mesh, scaleFactor) {
+  if (!mesh || !Number.isFinite(scaleFactor) || scaleFactor === 1) return;
+  mesh.updateMatrixWorld(true);
+  backboardTempBoxA.setFromObject(mesh);
+  backboardTempBoxA.getCenter(backboardTempVecA);
+  mesh.scale.multiplyScalar(scaleFactor);
+  mesh.updateMatrixWorld(true);
+  backboardTempBoxB.setFromObject(mesh);
+  backboardTempBoxB.getCenter(backboardTempVecB);
+  const delta = backboardTempVecA.sub(backboardTempVecB);
+  if (mesh.parent) {
+    mesh.parent.updateMatrixWorld(true);
+    backboardTempMat.copy(mesh.parent.matrixWorld).invert();
+    delta.applyMatrix4(backboardTempMat);
+  }
+  mesh.position.add(delta);
+  mesh.updateMatrixWorld(true);
+}
+
+function buildBackboardWorldBox(candidate, pool) {
+  const baseBox = new THREE.Box3().setFromObject(candidate.mesh);
+  const baseSize = new THREE.Vector3();
+  baseBox.getSize(baseSize);
+  const thinAxis = getThinAxisFromSize(baseSize);
+  const baseCenter = new THREE.Vector3();
+  baseBox.getCenter(baseCenter);
+  const maxDim = Math.max(baseSize.x, baseSize.y, baseSize.z);
+  const maxDist = Math.max(1, maxDim * 0.6);
+  const combined = baseBox.clone();
+  pool.forEach((cand) => {
+    if (!cand || !cand.box || !cand.size) return;
+    const candThin = getThinAxisFromSize(cand.size);
+    if (candThin !== thinAxis) return;
+    const ratio = Math.min(cand.size.x, cand.size.y, cand.size.z) /
+      Math.max(1e-3, Math.max(cand.size.x, cand.size.y, cand.size.z));
+    if (ratio > 0.35) return;
+    const center = cand.center ? cand.center : new THREE.Vector3();
+    if (center.distanceTo(baseCenter) > maxDist) return;
+    combined.union(cand.box);
+  });
+  return combined;
+}
+
+function mergeTargets(primary, fallback, maxCount) {
+  const merged = [];
+  const seen = new Set();
+  primary.forEach((cand) => {
+    if (!cand || !cand.mesh) return;
+    if (seen.has(cand.mesh.uuid)) return;
+    seen.add(cand.mesh.uuid);
+    merged.push(cand);
+  });
+  fallback.forEach((cand) => {
+    if (merged.length >= maxCount) return;
+    if (!cand || !cand.mesh) return;
+    if (seen.has(cand.mesh.uuid)) return;
+    seen.add(cand.mesh.uuid);
+    merged.push(cand);
+  });
+  return merged;
+}
+
+function addHoopMarker(candidate, type, index) {
+  const markerMesh = createHoopMarker(type);
+  markerMesh.name = `Hoop_${type}_${index + 1}`;
+  candidate.mesh.add(markerMesh);
+  markerMesh.position.copy(candidate.mesh.worldToLocal(candidate.center.clone()));
+  const maxDim = Math.max(candidate.size.x, candidate.size.y, candidate.size.z);
+  const radius = THREE.MathUtils.clamp(maxDim * 0.12, 2.5, 14);
+  setMarkerWorldRadius(markerMesh, radius, candidate.mesh, hoopMarkerBaseRadius);
+  hoopMarkers.push(markerMesh);
+}
+
+function addBackboardCornerMarkers(candidate) {
+  addBackboardCornerMarkersFromPool(candidate, []);
+}
+
+function addBackboardCornerMarkersFromPool(candidate, pool) {
+  if (!currentModel) return;
+  const worldBox = buildBackboardWorldBox(candidate, pool);
+  const worldSize = new THREE.Vector3();
+  worldBox.getSize(worldSize);
+  if (worldSize.lengthSq() === 0) return;
+
+  const thinAxis = getThinAxisFromSize(worldSize);
+  const axes = ["x", "y", "z"];
+  const otherAxes = axes.filter((axis) => axis !== thinAxis);
+  const worldCenter = new THREE.Vector3();
+  worldBox.getCenter(worldCenter);
+  const minFaceCenter = worldCenter.clone();
+  const maxFaceCenter = worldCenter.clone();
+  minFaceCenter[thinAxis] = worldBox.min[thinAxis];
+  maxFaceCenter[thinAxis] = worldBox.max[thinAxis];
+  const useMinFace = minFaceCenter.distanceToSquared(modelCenter) < maxFaceCenter.distanceToSquared(modelCenter);
+  const faceCoord = useMinFace ? worldBox.min[thinAxis] : worldBox.max[thinAxis];
+
+  const corners = [
+    { a: worldBox.min[otherAxes[0]], b: worldBox.min[otherAxes[1]] },
+    { a: worldBox.max[otherAxes[0]], b: worldBox.min[otherAxes[1]] },
+    { a: worldBox.min[otherAxes[0]], b: worldBox.max[otherAxes[1]] },
+    { a: worldBox.max[otherAxes[0]], b: worldBox.max[otherAxes[1]] }
+  ];
+  const maxDim = Math.max(worldSize.x, worldSize.y, worldSize.z);
+  const radius = THREE.MathUtils.clamp(maxDim * 0.05, 2, 12);
+
+  corners.forEach((corner, index) => {
+    const worldPos = new THREE.Vector3();
+    worldPos[thinAxis] = faceCoord;
+    worldPos[otherAxes[0]] = corner.a;
+    worldPos[otherAxes[1]] = corner.b;
+    const markerMesh = createBackboardCornerMarker(index);
+    candidate.mesh.add(markerMesh);
+    markerMesh.position.copy(candidate.mesh.worldToLocal(worldPos));
+    setMarkerWorldRadius(markerMesh, radius, candidate.mesh, backboardMarkerBaseRadius);
+    backboardCornerMarkers.push(markerMesh);
+  });
+}
+
+function placeHoopMarkers(model) {
+  clearHoopMarkers();
+  clearBackboardCornerMarkers();
+  if (!model || modelSize.lengthSq() === 0) return;
+  const maxSpan = Math.max(modelSize.x, modelSize.z);
+  const standCandidates = collectNamedMeshes(model, standNameHints)
+    .filter((cand) => Math.max(cand.size.x, cand.size.y, cand.size.z) < maxSpan * 0.9);
+  const backboardCandidates = collectNamedMeshes(model, backboardNameHints)
+    .filter((cand) => Math.max(cand.size.x, cand.size.y, cand.size.z) < maxSpan * 0.7);
+  const netCandidates = collectNamedMeshes(model, netNameHints)
+    .filter((cand) => Math.max(cand.size.x, cand.size.y, cand.size.z) < maxSpan * 0.45);
+  const standTargets = selectHoopTargets(standCandidates, "stand");
+  const backboardTargets = selectHoopTargets(backboardCandidates, "backboard");
+  const netTargets = selectHoopTargets(netCandidates, "net");
+  const fallbackCandidates = filterHoopCandidates(collectAllMeshes(model));
+  const regions = splitHoopRegions(fallbackCandidates);
+  const fallbackStands = [];
+  const fallbackBoards = [];
+  const fallbackNets = [];
+  [regions.nearMin, regions.nearMax].forEach((region) => {
+    const stand = pickStandCandidate(region);
+    if (stand) fallbackStands.push(stand);
+    const board = pickBackboardCandidate(region);
+    if (board) fallbackBoards.push(board);
+    const net = pickNetCandidate(region, stand);
+    if (net) fallbackNets.push(net);
+  });
+  const mergedStands = mergeTargets(standTargets, fallbackStands, 2);
+  const mergedBoards = mergeTargets(backboardTargets, fallbackBoards, 2);
+  const mergedNets = mergeTargets(netTargets, fallbackNets, 2);
+  mergedStands.forEach((cand, index) => addHoopMarker(cand, "stand", index));
+  mergedBoards.forEach((cand) => {
+    if (!cand.mesh.userData.backboardScaled) {
+      scaleMeshPreserveCenter(cand.mesh, backboardScaleFactor);
+      cand.mesh.userData.backboardScaled = true;
+    }
+    addBackboardCornerMarkersFromPool(cand, fallbackCandidates);
+  });
+  mergedNets.forEach((cand, index) => addHoopMarker(cand, "net", index));
 }
 
 function updateCourtMarkers() {
@@ -228,6 +605,8 @@ function updateCourtMarkers() {
     const y = getGroundHeightAt(pos.x, pos.z) + radius * 0.6;
     const markerMesh = new THREE.Mesh(courtMarkerGeometry, courtMarkerMaterial);
     markerMesh.name = `Court_${pos.name}`;
+    markerMesh.userData.type = pos.name === "center" ? "center" : "corner";
+    markerMesh.userData.handle = pos.name;
     markerMesh.position.set(pos.x, y, pos.z);
     markerMesh.scale.setScalar(radius / courtMarkerBaseRadius);
     courtMarkerGroup.add(markerMesh);
@@ -380,22 +759,25 @@ function frameModel(model) {
   const maxDim = Math.max(size.x, size.y, size.z);
   const targetSize = 4062.5;
   if (Number.isFinite(maxDim) && maxDim > 0) {
-    model.scale.setScalar(targetSize / maxDim);
+    courtBaseScale = targetSize / maxDim;
+    const uniformScale = courtBaseScale * courtScaleFactor;
+    const widthScale = Number.isFinite(courtWidthScaleFactor) ? uniformScale * courtWidthScaleFactor : uniformScale;
+    if (courtWidthAxis === "x") {
+      model.scale.set(widthScale, uniformScale, uniformScale);
+    } else if (courtWidthAxis === "z") {
+      model.scale.set(uniformScale, uniformScale, widthScale);
+    } else if (courtWidthAxis === "both") {
+      model.scale.set(widthScale, uniformScale, widthScale);
+    } else {
+      model.scale.setScalar(uniformScale);
+    }
   }
 
-  model.updateMatrixWorld(true);
-  const box2 = new THREE.Box3().setFromObject(model);
-  const size2 = new THREE.Vector3();
-  const center2 = new THREE.Vector3();
-  box2.getSize(size2);
-  box2.getCenter(center2);
-  modelBounds.copy(box2);
-  modelSize.copy(size2);
-  modelCenter.copy(center2);
+  updateCourtBounds(model);
 
-  controls.target.copy(center2);
-  const dist = Math.max(size2.x, size2.y, size2.z) * 1.25 + 50;
-  camera.position.copy(center2).add(new THREE.Vector3(dist, dist * 0.6, dist));
+  controls.target.copy(modelCenter);
+  const dist = Math.max(modelSize.x, modelSize.y, modelSize.z) * 1.25 + 50;
+  camera.position.copy(modelCenter).add(new THREE.Vector3(dist, dist * 0.6, dist));
   camera.near = Math.max(0.1, dist / 100);
   camera.far = dist * 10;
   camera.updateProjectionMatrix();
@@ -464,10 +846,15 @@ function applyModel(model) {
   if (currentModel) {
     disposeModel(currentModel);
   }
+  clearHoopMarkers();
+  clearBackboardCornerMarkers();
   currentModel = model;
   scene.add(currentModel);
   frameModel(currentModel);
   updateCourtMarkers();
+  if (hoopDotsEnabled) {
+    placeHoopMarkers(currentModel);
+  }
   return positionHoopMarker(currentModel);
 }
 
@@ -479,7 +866,17 @@ function placePlayer(player) {
   const box = new THREE.Box3().setFromObject(player);
   const size = new THREE.Vector3();
   box.getSize(size);
-  const baseSpan = Math.max(modelSize.x, modelSize.z);
+  const widthScale = Number.isFinite(courtWidthScaleFactor) && courtWidthScaleFactor > 0
+    ? courtWidthScaleFactor
+    : 1;
+  const unscaledX = courtWidthAxis === "x" || courtWidthAxis === "both"
+    ? modelSize.x / widthScale
+    : modelSize.x;
+  const unscaledZ = courtWidthAxis === "z" || courtWidthAxis === "both"
+    ? modelSize.z / widthScale
+    : modelSize.z;
+  const scaledSpan = Math.max(unscaledX, unscaledZ);
+  const baseSpan = courtScaleFactor > 0 ? scaledSpan / courtScaleFactor : scaledSpan;
   const targetHeight = baseSpan * playerToCourtRatio;
   if (Number.isFinite(size.y) && size.y > 0) {
     player.scale.setScalar(targetHeight / size.y);
